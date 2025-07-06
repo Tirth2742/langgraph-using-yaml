@@ -1,0 +1,22 @@
+agent:
+  llm:
+    # model: "google_genai:gemini-2.0-flash"  # Different Gemini model # Ollama model name
+
+    # model: "gemini-2.0-flash"  
+    # model_provider: "google_genai" # Different Gemini model # Ollama model name
+
+    model: "qwen3:0.6b"  
+    model_provider: "ollama" # Different Gemini model # Ollama model name
+    temperature: 0.7
+  # tools:
+  #   - name: "get_stock_price"
+  #     description: "Get current stock price by symbol"
+  #   - name: "document_qa"
+  #     description: "Answer questions from documents"
+  tools:
+    stock_price: true
+    document_qa: false
+    option_price: true
+  graph:
+    nodes: ["chatbot", "tools"]
+    entry_point: "chatbot"
