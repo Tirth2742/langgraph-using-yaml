@@ -1,0 +1,195 @@
+from langchain.chat_models import init_chat_model
+from langchain_community.chat_models import ChatOllama
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph
+from langgraph.graph.message import add_messages
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.pydantic_v1 import BaseModel, Field
+import yaml
+import os
+import json
+
+# Set your Google API key
+os.environ["GOOGLE_API_KEY"] = "AIzaSyDe82ID5jmROVw7ps-iv-2NZvBbJiw5mxg"
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+# Define tool schemas
+class StockPriceInput(BaseModel):
+    symbol: str = Field(description="Stock symbol, e.g., AAPL, MSFT")
+
+class OptionPriceInput(BaseModel):
+    symbol: str = Field(description="Option symbol, e.g., AAPL, MSFT")
+
+class DocumentQAInput(BaseModel):
+    question: str = Field(description="Question about documents")
+
+# Tool implementations
+@tool(args_schema=StockPriceInput)
+def get_stock_price(symbol: str) -> float:
+    '''Return the current price of a stock given the stock symbol'''
+    return {
+        "MSFT": 200.3,
+        "AAPL": 100.4,
+        "AMZN": 150.0,
+        "RIL": 87.6
+    }.get(symbol.upper(), 0.0)
+
+@tool(args_schema=DocumentQAInput)
+def document_qa(question: str) -> str:
+    '''Answer questions from documents'''
+    return f"Document response for: {question}"
+
+@tool(args_schema=OptionPriceInput)
+def option_price(symbol: str) -> float:
+    '''Return the current price of an option given the option symbol'''
+    return {
+        "MSFT": 220.0,
+        "AAPL": 200.4,
+        "AMZN": 250.0,
+        "RIL": 87.6
+    }.get(symbol.upper(), 0.0)
+
+def load_config(path="config.yaml"):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+def get_enabled_tools(config):
+    """Return enabled tools based on YAML config"""
+    tool_map = {
+        "stock_price": get_stock_price,
+        "document_qa": document_qa,
+        "option_price": option_price
+    }
+    return [tool_map[name] for name, enabled in config["agent"]["tools"].items() if enabled]
+
+def init_llm(config):
+    """Initialize LLM based on config"""
+    provider = config["agent"]["llm"]["provider"]
+    model = config["agent"]["llm"]["model"]
+    
+    if provider == "google_genai":
+        return init_chat_model(f"{provider}:{model}")
+    elif provider == "ollama":
+        return ChatOllama(model=model, format="json", temperature=0.7)
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+
+def create_ollama_tool_prompt(tools):
+    """Create structured tool prompt for Ollama"""
+    tool_descs = []
+    for t in tools:
+        tool_descs.append(
+            f"## {t.name}\n"
+            f"Description: {t.description}\n"
+            f"Arguments: {json.dumps(t.args)}\n"
+        )
+    
+    return ChatPromptTemplate.from_messages([
+        ("system", 
+         "You are a helpful assistant. When you need to use a tool, respond with JSON containing: "
+         "{\"tool\": \"tool_name\", \"arguments\": {\"arg1\": \"value\"}}.\n\n"
+         "Available tools:\n" + "\n".join(tool_descs)),
+        ("placeholder", "{messages}")
+    ])
+
+def chatbot_node(llm, tools, config):
+    """Create chatbot node with provider-specific handling"""
+    if config["agent"]["llm"]["provider"] == "google_genai":
+        llm_with_tools = llm.bind_tools(tools)
+        def gemini_chatbot(state: State):
+            return {"messages": [llm_with_tools.invoke(state["messages"])]}
+        return gemini_chatbot
+    
+    # Ollama-specific setup
+    ollama_prompt = create_ollama_tool_prompt(tools)
+    ollama_chain = ollama_prompt | llm | JsonOutputParser()
+    
+    def ollama_chatbot(state: State):
+        result = ollama_chain.invoke({"messages": state["messages"]})
+        
+        # Check if tool call response
+        if "tool" in result:
+            tool_name = result["tool"]
+            tool_args = result["arguments"]
+            
+            # Find matching tool
+            tool = next((t for t in tools if t.name == tool_name), None)
+            if not tool:
+                return {"messages": [{
+                    "role": "assistant", 
+                    "content": f"Error: Unknown tool {tool_name}"
+                }]}
+            
+            # Create tool call structure
+            return {"messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "name": tool_name,
+                    "args": tool_args,
+                    "id": f"call_{tool_name}_{id(tool)}"
+                }]
+            }]}
+        else:
+            # Regular response
+            return {"messages": [{
+                "role": "assistant",
+                "content": result.get("response", "No response generated")
+            }]}
+    
+    return ollama_chatbot
+
+def main():
+    config = load_config()
+    
+    # Initialize model
+    llm = init_llm(config)
+    
+    # Initialize tools
+    tools = get_enabled_tools(config)
+    print(f"Enabled tools: {[t.name for t in tools]}")
+    
+    # Create chatbot node
+    chatbot = chatbot_node(llm, tools, config)
+    
+    # Build graph
+    builder = StateGraph(State)
+    
+    # Add nodes
+    builder.add_node("chatbot", chatbot)
+    builder.add_node("tools", ToolNode(tools))
+    
+    # Set edges
+    builder.set_entry_point("chatbot")
+    builder.add_conditional_edges("chatbot", tools_condition)
+    builder.add_edge("tools", "chatbot")
+    
+    graph = builder.compile()
+    
+    # Test queries
+    queries = [
+        "What is the price of AAPL stock right now?",
+        "What's the current option price for MSFT?",
+        "What's our vacation policy?"
+    ]
+    
+    for query in queries:
+        print(f"\nQuery: {query}")
+        state = graph.invoke({"messages": [{"role": "user", "content": query}]})
+        last_msg = state["messages"][-1]
+        
+        # Handle different response formats
+        if "content" in last_msg:
+            print(f"Response: {last_msg['content']}")
+        elif "tool_calls" in last_msg:
+            tool_call = last_msg["tool_calls"][0]
+            print(f"Tool Call: {tool_call['name']} with args: {tool_call['args']}")
+        else:
+            print("Unexpected response format:", json.dumps(last_msg, indent=2))
+
+if __name__ == "__main__":
+    main(
